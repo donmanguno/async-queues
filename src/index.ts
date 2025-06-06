@@ -13,6 +13,7 @@ export interface QueuedItem<T, R> {
 export class AsyncQueue<T, R> {
   private _queue: QueuedItem<T, R>[] = [];
 
+	private _startTime?: number;
   private _interval: number;
   private _queueProcessor?: Processor<T, R>;
   private _thisArg?: {};
@@ -56,6 +57,8 @@ export class AsyncQueue<T, R> {
     
     this._processing = true;
     while (this._queue.length > 0 && this._paused == false) {
+			// set the start time when processing the first item
+			if (this._processed == 0) this._startTime = new Date().getTime();
       // no delay on the first loop
       if (this._interval > 0 && this._processed > 0) { await setTimeout(this._interval) }
       const { processor, args, thisArg, resolve, reject } = this._queue.shift()!;
@@ -67,17 +70,22 @@ export class AsyncQueue<T, R> {
         reject(error); // Reject the promise associated with this item
       } finally {
         this._processed++
-      }
+			}
     }
     this._processing = false;
   }
   
   /**
   * pause the queue
+	* @param ms how long to pause for
   */
-  pause() {
+  pause(ms?: number) {
     this._paused = true;
     this._processing = false;
+		if (ms) (async function (that: AsyncQueue<T,R>, ms: number) {
+			await setTimeout(ms);
+			that.resume();
+		})(this, ms);
   }
   
   /**
@@ -108,6 +116,13 @@ export class AsyncQueue<T, R> {
   get interval(): number {
     return this._interval;
   }
+
+	/** 
+	 * @returns The number of milliseconds remaining
+	 */
+	get timeleft(): number {
+		return this.size * this.interval;
+	}
   
   /**
   * Set a new queue interval
@@ -115,6 +130,13 @@ export class AsyncQueue<T, R> {
   set interval(interval: number) {
     this._interval = interval;
   }
+
+	/**
+	 * Get the time that this queue's first item was processed.  Returns undefined if nothing has been processed
+	 */
+	get startTime(): number | undefined {
+		return this._startTime
+	}
 
   /**
    * get the queue processor function
@@ -160,7 +182,7 @@ export class AsyncQueues<T, R> {
 	*/
 	create(name: string, processor?: Processor<T, R>, interval?: number, thisArg?: object | undefined): AsyncQueue<T, R> | undefined {
 		if (!processor) processor = this._defaultProcessor;
-		if (!interval) interval = this._defaultInterval;
+		if (!interval && interval != 0) interval = this._defaultInterval;
 		if (!thisArg) thisArg = this._defaultThisArg;
 
 		let queue = new AsyncQueue(processor, interval, thisArg);
@@ -236,56 +258,92 @@ export class AsyncQueues<T, R> {
 			});
 			return processed;
 		}
-	}
+	}	
 	
 	/**
-	* 
-	* @param name Name of the queue
-	* @returns the interval in ms of the named queue
+	* Gets the size of a named queue or the total size of all queues.
+	* @param name Name of the queue. If not provided, max time left will be returned.
+	* @returns The amount of time left for the queue, or the max for all queues
 	*/
-	getQueueInterval(name: string): number | undefined {
-		const queue = this._queues.get(name);
-		if (queue) {
-			return queue.interval;
+	getTimeLeft(name?: string): number {
+		if (name) {
+			const queue = this._queues.get(name);
+			if (queue) {
+				return queue.timeleft;
+			} else {
+				console.warn(`no queue with name ${name}`);
+				return 0;
+			}
 		} else {
-			console.warn(`no queue with name ${name}`);
+			let timeleft = 0;
+			this._queues.forEach(queue => {
+				timeleft = Math.max(timeleft, queue.timeleft);
+			});
+			return timeleft;
 		}
 	}
-	
+
 	/**
-	* 
-	* @param name Name of the queue
-	* @param interval New interval in ms
-	* @returns the new interval of the named queue
-	*/
-	setQueueInterval(name: string, interval: number): number | undefined {
-		const queue = this._queues.get(name);
-		if (queue) {
-			queue.interval = interval;
-			return queue.interval;
+	 * Gets the start time for the named queue, or the queue that started first.
+	 * @param name Name of the queue. If not provided, the earliest start time will be returned.
+	 * @returns The epoch timestamp when the queue was started. Undefined if queue not started.
+	 */
+	getStartTime(name?: string): number | undefined {
+		if (name) {
+			const queue = this._queues.get(name);
+			if (queue) {
+				return queue.startTime;
+			} else {
+				console.warn(`no queue with name ${name}`);
+				return;
+			}
 		} else {
-			console.warn(`no queue with name ${name}`);
+			let startTime: number | undefined;
+			this._queues.forEach(queue => {
+				if (queue.startTime) {
+					startTime = startTime ? Math.min(startTime, queue.startTime) : queue.startTime
+				}
+			})
+			return startTime;
 		}
+	}
+
+	/**
+	 * Generates a report on the named queue or all queues
+	 * @param name Optional queue name on which to report
+	 * @returns a report on the named queue, or on all queues if no name provided
+	 */
+	getReport(name?: string): string {
+		let startTime = this.getStartTime(name);
+
+		return `QUEUE REPORT${name ? `: ${name}` : ''}
+\t${name ? '' : 'Default '}Processor: ${name ? this.getQueue(name)?.processor : this.defaultProcessor}
+\tStarted: ${startTime ? new Date(startTime).toLocaleString() : 'not started'}
+\tElapsed: ${startTime ? Math.round((new Date().getTime() - startTime)/600)/100 + ' minutes' : 'not started'}
+\t${name ? '' : 'Default '}Interval: ${name ? this.getQueue(name)?.interval : this.defaultInterval}
+\tProcessed: ${this.getProcessed(name)}
+\tIn queue: ${this.getSize(name)}
+\tTime to flush current queue: ${Math.round(this.getTimeLeft(name)/600)/100} minutes`
 	}
 
 	/**
 	* @returns The current default interval
 	*/
-	get interval(): number | undefined {
+	get defaultInterval(): number | undefined {
 		return this._defaultInterval;
 	}
 	
 	/**
 	* Set a new default interval
 	*/
-	set interval(interval: number) {
+	set defaultInterval(interval: number) {
 		this._defaultInterval = interval;
 	}
 
 	/**
 	 * get the default processor function
 	 */
-	get processor(): Processor<T, R> | undefined {
+	get defaultProcessor(): Processor<T, R> | undefined {
 		return this._defaultProcessor;
 	}
 
@@ -293,7 +351,7 @@ export class AsyncQueues<T, R> {
 	 * Set a new default processor function
 	 * This will only apply to newly-created queues (without their own processor)
 	 */
-	set processor(processor: Processor<T, R>) {
+	set defaultProcessor(processor: Processor<T, R>) {
 		this._defaultProcessor = processor;
 	}
 }

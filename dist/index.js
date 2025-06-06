@@ -1,6 +1,7 @@
 import { setTimeout } from 'timers/promises';
 export class AsyncQueue {
     _queue = [];
+    _startTime;
     _interval;
     _queueProcessor;
     _thisArg;
@@ -30,6 +31,8 @@ export class AsyncQueue {
         }
         this._processing = true;
         while (this._queue.length > 0 && this._paused == false) {
+            if (this._processed == 0)
+                this._startTime = new Date().getTime();
             if (this._interval > 0 && this._processed > 0) {
                 await setTimeout(this._interval);
             }
@@ -48,9 +51,14 @@ export class AsyncQueue {
         }
         this._processing = false;
     }
-    pause() {
+    pause(ms) {
         this._paused = true;
         this._processing = false;
+        if (ms)
+            (async function (that, ms) {
+                await setTimeout(ms);
+                that.resume();
+            })(this, ms);
     }
     resume() {
         this._paused = false;
@@ -65,8 +73,14 @@ export class AsyncQueue {
     get interval() {
         return this._interval;
     }
+    get timeleft() {
+        return this.size * this.interval;
+    }
     set interval(interval) {
         this._interval = interval;
+    }
+    get startTime() {
+        return this._startTime;
     }
     get processor() {
         return this._queueProcessor;
@@ -88,7 +102,7 @@ export class AsyncQueues {
     create(name, processor, interval, thisArg) {
         if (!processor)
             processor = this._defaultProcessor;
-        if (!interval)
+        if (!interval && interval != 0)
             interval = this._defaultInterval;
         if (!thisArg)
             thisArg = this._defaultThisArg;
@@ -145,35 +159,70 @@ export class AsyncQueues {
             return processed;
         }
     }
-    getQueueInterval(name) {
-        const queue = this._queues.get(name);
-        if (queue) {
-            return queue.interval;
+    getTimeLeft(name) {
+        if (name) {
+            const queue = this._queues.get(name);
+            if (queue) {
+                return queue.timeleft;
+            }
+            else {
+                console.warn(`no queue with name ${name}`);
+                return 0;
+            }
         }
         else {
-            console.warn(`no queue with name ${name}`);
+            let timeleft = 0;
+            this._queues.forEach(queue => {
+                timeleft = Math.max(timeleft, queue.timeleft);
+            });
+            return timeleft;
         }
     }
-    setQueueInterval(name, interval) {
-        const queue = this._queues.get(name);
-        if (queue) {
-            queue.interval = interval;
-            return queue.interval;
+    getStartTime(name) {
+        if (name) {
+            const queue = this._queues.get(name);
+            if (queue) {
+                return queue.startTime;
+            }
+            else {
+                console.warn(`no queue with name ${name}`);
+                return;
+            }
         }
         else {
-            console.warn(`no queue with name ${name}`);
+            let startTime;
+            this._queues.forEach(queue => {
+                if (queue.startTime) {
+                    startTime = startTime ? Math.min(startTime, queue.startTime) : queue.startTime;
+                }
+            });
+            return startTime;
         }
     }
-    get interval() {
+    getReport(name) {
+        let startTime = this.getStartTime(name);
+        let processor;
+        if (name)
+            processor = this.getQueue(name)?.processor;
+        return `QUEUE REPORT${name ? `: ${name}` : ''}
+\t${name ? '' : 'Default '}Processor: ${processor ? processor.name : this.defaultProcessor?.name}
+\tStarted: ${startTime ? new Date(startTime).toLocaleString() : 'not started'}
+\tElapsed: ${startTime ? Math.round((new Date().getTime() - startTime) / 600) / 100 + ' minutes' : 'not started'}
+\t${name ? '' : 'Default '}Interval: ${name ? this.getQueue(name)?.interval : this.defaultInterval}
+\tProcessed: ${this.getProcessed(name)}
+\tIn queue: ${this.getSize(name)}
+\tTime to flush current queue: ${Math.round(this.getTimeLeft(name) / 600) / 100} minutes`;
+    }
+    get defaultInterval() {
         return this._defaultInterval;
     }
-    set interval(interval) {
+    set defaultInterval(interval) {
         this._defaultInterval = interval;
     }
-    get processor() {
+    get defaultProcessor() {
         return this._defaultProcessor;
     }
-    set processor(processor) {
+    set defaultProcessor(processor) {
         this._defaultProcessor = processor;
     }
 }

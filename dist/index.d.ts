@@ -8,6 +8,7 @@ export interface QueuedItem<T, R> {
 }
 export declare class AsyncQueue<T, R> {
     private _queue;
+    private _startTime?;
     private _interval;
     private _queueProcessor?;
     private _thisArg?;
@@ -17,12 +18,14 @@ export declare class AsyncQueue<T, R> {
     constructor(processor?: Processor<T, R>, interval?: number, thisArg?: {});
     enqueue(args?: T[], processor?: Processor<T, R>, thisArg?: {}): Promise<R>;
     private _processQueue;
-    pause(): void;
+    pause(ms?: number): void;
     resume(): void;
     get size(): number;
     get processed(): number;
     get interval(): number;
+    get timeleft(): number;
     set interval(interval: number);
+    get startTime(): number | undefined;
     get processor(): Processor<T, R> | undefined;
     set processor(processor: Processor<T, R>);
 }
@@ -37,11 +40,12 @@ export declare class AsyncQueues<T, R> {
     getQueue(name: string): AsyncQueue<T, R> | undefined;
     getSize(name?: string): number;
     getProcessed(name?: string): number;
-    getQueueInterval(name: string): number | undefined;
-    setQueueInterval(name: string, interval: number): number | undefined;
-    get interval(): number | undefined;
-    set interval(interval: number);
-    get processor(): Processor<T, R> | undefined;
-    set processor(processor: Processor<T, R>);
+    getTimeLeft(name?: string): number;
+    getStartTime(name?: string): number | undefined;
+    getReport(name?: string): string;
+    get defaultInterval(): number | undefined;
+    set defaultInterval(interval: number);
+    get defaultProcessor(): Processor<T, R> | undefined;
+    set defaultProcessor(processor: Processor<T, R>);
 }
 //# sourceMappingURL=index.d.ts.map
