@@ -1,36 +1,52 @@
 import { setTimeout } from 'timers/promises';
+import { EventEmitter } from 'events';
+import { randomUUID } from 'crypto';
 
-export type Processor<T, R> = (...args: T[]) => Promise<R>;
+export type Processor<T, R, C> = (this: C, ...args: T[]) => Promise<R>;
 
-export interface QueuedItem<T, R> {
+export interface QueuedItem<T, R, C> {
+  id: string;
   args: T[];
-  thisArg?: {};
-  processor: (...args: T[]) => Promise<R>;
+  thisArg?: C;
+  processor: Processor<T, R, C>;
   resolve: (value: R | PromiseLike<R>) => void;
   reject: (reason?: any) => void;
 }
 
-export class AsyncQueue<T, R> {
-  private _queue: QueuedItem<T, R>[] = [];
+export type AsyncQueueEvents<T, R, C> = {
+  enqueue: (item: QueuedItem<T, R, C>) => void;
+  dequeue: (item: QueuedItem<T, R, C>) => void;
+  processed: (result: R, item: QueuedItem<T, R, C>) => void;
+  error: (error: any, item: QueuedItem<T, R, C>) => void;
+  pause: () => void;
+  resume: () => void;
+};
 
-	private _startTime?: number;
+export class AsyncQueue<T, R, C = undefined> extends EventEmitter {
+  private _queue: QueuedItem<T, R, C>[] = [];
+
+  private _startTime?: number;
   private _interval: number;
-  private _queueProcessor?: Processor<T, R>;
-  private _thisArg?: {};
+  private _queueProcessor?: Processor<T, R, C>;
+  private _thisArg?: C;
 
-  private _processing: boolean = false;
   private _processed: number = 0;
   private _paused: boolean = false;
+  private _concurrency: number = 1;
+  private _running: number = 0;
   
   /**
   * @param processor The default processor function for this queue
   * @param interval how long to wait between processing queue items
   * @param thisArg the default "this" context for the processor execution
+  * @param concurrency how many items to process in parallel (default 1)
   */
-  constructor(processor?: Processor<T, R>, interval: number = 0, thisArg?: {}) {
+  constructor(processor?: Processor<T, R, C>, interval: number = 0, thisArg?: C, concurrency: number = 1) {
+    super();
     this._queueProcessor = processor;
     this._interval = interval;
     this._thisArg = thisArg;
+    this._concurrency = concurrency;
   }
   
   /**
@@ -38,62 +54,120 @@ export class AsyncQueue<T, R> {
   * @param item This item should be whatever argument the Processor function expects.
   * @param processor A custom processor for this queue item
   * @param thisArg the "this" context for the processor execution for this queue item
-  * @returns A Promise that resolves after the item is processed.
+  * @returns An object with the unique id and a Promise that resolves after the item is processed.
+  *
+  * @emits enqueue
   */
-  enqueue(args: T[] = [], processor?: Processor<T, R>, thisArg?: {}): Promise<R> {
+  enqueue(args: T[] = [], processor?: Processor<T, R, C>, thisArg?: C): { id: string, promise: Promise<R> } {
     if (!processor) processor = this._queueProcessor;
     if (!thisArg) thisArg = this._thisArg;
-    return new Promise((resolve, reject) => {
+    const id = randomUUID();
+    let rejectRef: (reason?: any) => void;
+    const promise = new Promise<R>((resolve, reject) => {
+      rejectRef = reject;
       if (!processor) return reject(`no processor!`)
-      this._queue.push({ processor, args, thisArg, resolve, reject });
-      this._processQueue();
+      const item: QueuedItem<T, R, C> = { id, processor, args, thisArg, resolve, reject };
+      this._queue.push(item);
+      this.emit('enqueue', item);
+      this._tryProcessNext();
     });
+    // @ts-ignore: rejectRef will always be set synchronously
+    (promise as any)._reject = rejectRef!;
+    return { id, promise };
   }
-  
+
+  /**
+   * Cancel a pending item by its id. If found and not yet processing, removes it and rejects its promise.
+   * @param id The id of the item to cancel.
+   * @returns true if cancelled, false if not found or already processing.
+   */
+  cancel(id: string): boolean {
+    const idx = this._queue.findIndex(item => item.id === id);
+    if (idx !== -1) {
+      const [item] = this._queue.splice(idx, 1);
+      item.reject(new Error('Cancelled'));
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * Clear all pending (not yet processing) items from the queue, rejecting their promises.
+   */
+  clear(): void {
+    while (this._queue.length > 0) {
+      const item = this._queue.shift()!;
+      item.reject(new Error('Flushed'));
+    }
+  }
+
+  private _tryProcessNext() {
+    // Start as many as possible up to concurrency
+    while (
+      this._running < this._concurrency &&
+      this._queue.length > 0 &&
+      !this._paused
+    ) {
+      this._processQueue();
+    }
+  }
+
   private async _processQueue(): Promise<void> {
-    if (this._processing) {
+    if (this._paused || this._running >= this._concurrency || this._queue.length === 0) {
       return;
     }
-    
-    this._processing = true;
-    while (this._queue.length > 0 && this._paused == false) {
-			// set the start time when processing the first item
-			if (this._processed == 0) this._startTime = new Date().getTime();
-      // no delay on the first loop
-      if (this._interval > 0 && this._processed > 0) { await setTimeout(this._interval) }
-      const { processor, args, thisArg, resolve, reject } = this._queue.shift()!;
-      try {
-        const result = processor.apply(thisArg, args)
-        resolve(result); // Resolve the promise associated with this item
-      } catch (error) {
-        console.error("Error processing queue item:", error);
-        reject(error); // Reject the promise associated with this item
-      } finally {
-        this._processed++
-			}
+    this._running++;
+    // set the start time when processing the first item
+    if (this._processed == 0) this._startTime = new Date().getTime();
+    // no delay on the first loop
+    if (this._interval > 0 && this._processed > 0) { await setTimeout(this._interval) }
+    const item = this._queue.shift()!;
+    this.emit('dequeue', item);
+    const { processor, args, thisArg, resolve, reject } = item;
+    try {
+      const result = await processor.apply(thisArg as C, args);
+      resolve(result); // Resolve the promise associated with this item
+      this.emit('processed', result, item);
+    } catch (error) {
+      console.error("Error processing queue item:", error);
+      reject(error); // Reject the promise associated with this item
+      if (this.listenerCount('error') > 0) {
+        this.emit('error', error, item);
+      } else {
+        console.error('Unhandled queue error:', error, item);
+      }
+    } finally {
+      this._processed++;
+      this._running--;
+      // Try to process more if possible
+      this._tryProcessNext();
     }
-    this._processing = false;
   }
   
   /**
   * pause the queue
-	* @param ms how long to pause for
+  * @param ms how long to pause for
+  *
+  * @emits pause
   */
   pause(ms?: number) {
     this._paused = true;
-    this._processing = false;
-		if (ms) (async function (that: AsyncQueue<T,R>, ms: number) {
-			await setTimeout(ms);
-			that.resume();
-		})(this, ms);
+    this.emit('pause');
+    if (ms) (async function (that: AsyncQueue<T,R,C>, ms: number) {
+      await setTimeout(ms);
+      that.resume();
+    })(this, ms);
   }
   
   /**
   * resume the queue
+  *
+  * @emits resume
   */
   resume() {
     this._paused = false;
-    this._processQueue();
+    this.emit('resume');
+    this._tryProcessNext();
   }
   
   /**
@@ -117,12 +191,12 @@ export class AsyncQueue<T, R> {
     return this._interval;
   }
 
-	/** 
-	 * @returns The number of milliseconds remaining
-	 */
-	get timeleft(): number {
-		return this.size * this.interval;
-	}
+  /** 
+   * @returns The number of milliseconds remaining
+   */
+  get timeleft(): number {
+    return this.size * this.interval;
+  }
   
   /**
   * Set a new queue interval
@@ -131,17 +205,17 @@ export class AsyncQueue<T, R> {
     this._interval = interval;
   }
 
-	/**
-	 * Get the time that this queue's first item was processed.  Returns undefined if nothing has been processed
-	 */
-	get startTime(): number | undefined {
-		return this._startTime
-	}
+  /**
+   * Get the time that this queue's first item was processed.  Returns undefined if nothing has been processed
+   */
+  get startTime(): number | undefined {
+    return this._startTime
+  }
 
   /**
    * get the queue processor function
    */
-  get processor(): Processor<T, R> | undefined {
+  get processor(): Processor<T, R, C> | undefined {
     return this._queueProcessor;
   }
 
@@ -149,8 +223,23 @@ export class AsyncQueue<T, R> {
    * Set a new queue processor function
    * This will only apply to newly-enqueued items (without their own processor)
    */
-  set processor(processor: Processor<T, R>) {
+  set processor(processor: Processor<T, R, C>) {
     this._queueProcessor = processor;
+  }
+
+  /**
+   * Get the current concurrency value
+   */
+  get concurrency(): number {
+    return this._concurrency;
+  }
+
+  /**
+   * Set a new concurrency value
+   */
+  set concurrency(value: number) {
+    this._concurrency = Math.max(1, value);
+    this._tryProcessNext();
   }
 }
 
@@ -159,14 +248,15 @@ export class AsyncQueue<T, R> {
 * @param processor The default processor function for this set of queues
 * @param interval The default interval for this set of queues
 */
-export class AsyncQueues<T, R> {
-	private _queues: Map<string, AsyncQueue<T, R>> = new Map();
+export class AsyncQueues<T, R, C> {
+	private _queues: Map<string, AsyncQueue<T, R, C>> = new Map();
+	private _idToQueue: Map<string, AsyncQueue<T, R, C>> = new Map();
 
-	private _defaultProcessor: Processor<T, R> | undefined;
+	private _defaultProcessor: Processor<T, R, C> | undefined;
 	private _defaultInterval: number | undefined;
-	private _defaultThisArg: object | undefined;
+	private _defaultThisArg: C | undefined;
 	
-	constructor (processor?: Processor<T, R>, interval?: number, thisArg?: {}) {
+	constructor (processor?: Processor<T, R, C>, interval?: number, thisArg?: C) {
 		this._defaultProcessor = processor;
 		this._defaultInterval = interval;
 		this._defaultThisArg = thisArg;
@@ -180,13 +270,21 @@ export class AsyncQueues<T, R> {
 	* @param thisArg the "this" context for the processor execution
 	* @returns The newly created AsyncQueue.
 	*/
-	create(name: string, processor?: Processor<T, R>, interval?: number, thisArg?: object | undefined): AsyncQueue<T, R> | undefined {
+	create(name: string, processor?: Processor<T, R, C>, interval?: number, thisArg?: C): AsyncQueue<T, R, C> | undefined {
 		if (!processor) processor = this._defaultProcessor;
 		if (!interval && interval != 0) interval = this._defaultInterval;
 		if (!thisArg) thisArg = this._defaultThisArg;
 
 		let queue = new AsyncQueue(processor, interval, thisArg);
 		this._queues.set(name, queue);
+    // Listen for processed, cancelled, and flushed items to clean up the id map
+    queue.on('processed', (_result, item) => {
+      this._idToQueue.delete(item.id);
+    });
+    queue.on('error', (_err, item) => {
+      this._idToQueue.delete(item.id);
+    });
+    // Also clean up on clear/cancel, but those will emit error
 		return queue;
 	}
 	
@@ -195,21 +293,23 @@ export class AsyncQueues<T, R> {
 	* @param name Name of the queue.
 	* @param args This item should be an array of whatever arguments the Processor function expects.
 	* @param processor A custom processor for this queue item
-	* @returns A Promise that resolves after the item is processed.
+	* @returns An object with the unique id and a Promise that resolves after the item is processed.
 	*/
-	enqueue(name: string, args: T[], processor?: Processor<T, R>, thisArg?: {}): Promise<R> {
+	enqueue(name: string, args: T[], processor?: Processor<T, R, C>, thisArg?: C): { id: string, promise: Promise<R> } {
 		const queue = this._queues.get(name);
 		if (!queue) {
-			return Promise.reject(new Error(`No queue with name "${name}"`));
+			throw new Error(`No queue with name "${name}"`);
 		}
-		return queue.enqueue(args, processor, thisArg);
+		const { id, promise } = queue.enqueue(args, processor, thisArg);
+    this._idToQueue.set(id, queue);
+		return { id, promise };
 	}
 	
 	/**
 	* @param name  Name of the queue.
 	* @returns a queue
 	*/
-	getQueue(name: string): AsyncQueue<T, R> | undefined {
+	getQueue(name: string): AsyncQueue<T, R, C> | undefined {
 		const queue = this._queues.get(name)
 		return queue;
 	}
@@ -343,7 +443,7 @@ export class AsyncQueues<T, R> {
 	/**
 	 * get the default processor function
 	 */
-	get defaultProcessor(): Processor<T, R> | undefined {
+	get defaultProcessor(): Processor<T, R, C> | undefined {
 		return this._defaultProcessor;
 	}
 
@@ -351,7 +451,85 @@ export class AsyncQueues<T, R> {
 	 * Set a new default processor function
 	 * This will only apply to newly-created queues (without their own processor)
 	 */
-	set defaultProcessor(processor: Processor<T, R>) {
+	set defaultProcessor(processor: Processor<T, R, C>) {
 		this._defaultProcessor = processor;
+	}
+
+	/**
+	 * Cancel a pending item in a named queue by its id.
+	 * @param name Name of the queue.
+	 * @param id The id of the item to cancel.
+	 * @returns true if cancelled, false if not found or already processing.
+	 */
+	cancel(name: string, id: string): boolean {
+		const queue = this._queues.get(name);
+		if (!queue) return false;
+		return queue.cancel(id);
+	}
+
+	/**
+	 * Cancel a pending item by its id, searching all managed queues.
+	 * @param id The id of the item to cancel.
+	 * @returns true if cancelled, false if not found or already processing.
+	 */
+	cancelById(id: string): boolean {
+		const queue = this._idToQueue.get(id);
+		if (!queue) return false;
+		return queue.cancel(id);
+	}
+
+	/**
+	 * Remove a named queue and flush all its pending items.
+	 * @param name Name of the queue to remove.
+	 * @returns true if removed, false if not found.
+	 */
+	remove(name: string): boolean {
+		const queue = this._queues.get(name);
+		if (!queue) return false;
+		queue.clear();
+		this._queues.delete(name);
+		return true;
+	}
+
+	/**
+	 * Clear (flush) all pending items in the named queue.
+	 * @param name Name of the queue to clear.
+	 * @returns true if cleared, false if not found.
+	 */
+	clear(name: string): boolean {
+		const queue = this._queues.get(name);
+		if (!queue) return false;
+		queue.clear();
+		return true;
+	}
+
+	/**
+	 * Pause all queues if no name is provided, or the named queue.
+	 * @param name Optional name of the queue to pause. If not provided, pauses all queues.
+	 */
+	pause(name?: string): void {
+		if (name) {
+			const queue = this._queues.get(name);
+			if (queue) queue.pause();
+		} else {
+			for (const queue of this._queues.values()) {
+				queue.pause();
+			}
+		}
+	}
+
+	/**
+	 * Resume all queues if no name is provided, or the named queue.
+	 * @param name Optional name of the queue to resume. If not provided, resumes all queues.
+	 */
+	resume(name?: string): void {
+		if (name) {
+			const queue = this._queues.get(name);
+			if (queue) queue.resume();
+		} else {
+			for (const queue of this._queues.values()) {
+				queue.resume();
+			}
+		}
 	}
 }
