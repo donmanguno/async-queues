@@ -62,17 +62,13 @@ export class AsyncQueue<T, R, C = undefined> extends EventEmitter {
     if (!processor) processor = this._queueProcessor;
     if (!thisArg) thisArg = this._thisArg;
     const id = randomUUID();
-    let rejectRef: (reason?: any) => void;
     const promise = new Promise<R>((resolve, reject) => {
-      rejectRef = reject;
       if (!processor) return reject(`no processor!`)
       const item: QueuedItem<T, R, C> = { id, processor, args, thisArg, resolve, reject };
       this._queue.push(item);
       this.emit('enqueue', item);
       this._tryProcessNext();
     });
-    // @ts-ignore: rejectRef will always be set synchronously
-    (promise as any)._reject = rejectRef!;
     return { id, promise };
   }
 
@@ -417,7 +413,7 @@ export class AsyncQueues<T, R, C> {
 		let startTime = this.getStartTime(name);
 
 		return `QUEUE REPORT${name ? `: ${name}` : ''}
-\t${name ? '' : 'Default '}Processor: ${name ? this.getQueue(name)?.processor : this.defaultProcessor}
+\t${name ? '' : 'Default '}Processor: ${name ? this.getQueue(name)?.processor?.name : this.defaultProcessor?.name}
 \tStarted: ${startTime ? new Date(startTime).toLocaleString() : 'not started'}
 \tElapsed: ${startTime ? Math.round((new Date().getTime() - startTime)/600)/100 + ' minutes' : 'not started'}
 \t${name ? '' : 'Default '}Interval: ${name ? this.getQueue(name)?.interval : this.defaultInterval}
